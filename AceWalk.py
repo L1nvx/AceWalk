@@ -137,9 +137,10 @@ class AclWalk:
         self.__kdcHost = cmdLineOptions.dc_host
 
         self.__search_identity = cmdLineOptions.search_identity
-        self.__max_depth = getattr(cmdLineOptions, "max_depth", 3)
+        self.__max_depth = getattr(cmdLineOptions, "max_depth", 6)
         self.__no_emoji = False
 
+        # Limits to keep output sane
         raw_max_targets = getattr(cmdLineOptions, "max_targets", 30)
         self.__max_targets = raw_max_targets if raw_max_targets and raw_max_targets > 0 else None
 
@@ -149,6 +150,7 @@ class AclWalk:
         raw_max_child_trustees = getattr(cmdLineOptions, "max_child_trustees", 25)
         self.__max_child_trustees = raw_max_child_trustees if raw_max_child_trustees and raw_max_child_trustees > 0 else None
 
+        # Policy
         self.__include_deny = True
         self.__include_audit = True
         self.__only_expand_principals = False
@@ -192,8 +194,14 @@ class AclWalk:
 
         if aceType in ACE_WITH_OBJECTTYPE:
             try:
-                if "ObjectType" in ace and len(bytes(ace["ObjectType"])) == 16:
-                    objectType = str(UUID(bytes_le=bytes(ace["ObjectType"])))
+                raw_objtype = None
+                try:
+                    raw_objtype = acc["ObjectType"]
+                except Exception:
+                    raw_objtype = None
+
+                if raw_objtype and len(bytes(raw_objtype)) == 16:
+                    objectType = str(UUID(bytes_le=bytes(raw_objtype)))
                     objectTypeName = self.resolve_guid(objectType)
             except (KeyError, ValueError):
                 pass
@@ -295,11 +303,13 @@ class AclWalk:
 
             self.objects[dn] = obj_data
 
+        # Build children index (one-level)
         for dn, obj in self.objects.items():
             p = dn_parent(dn)
             if p:
                 self.children_index[p].append(obj)
 
+        # Sort children nicely
         for p, lst in self.children_index.items():
             lst.sort(key=lambda o: (self._type_order(o), self._obj_name(o).lower()))
 
@@ -334,6 +344,8 @@ class AclWalk:
 
         return None
 
+    # ---------- helpers ----------
+
     def _obj_name(self, obj_data):
         display = (obj_data.get("attr") or {}).get("displayName")
         if display:
@@ -350,6 +362,7 @@ class AclWalk:
 
     def _is_container(self, obj_data) -> bool:
         cls = set(obj_data.get("objectClass", []))
+        # conservative: OU/domain/container
         return bool(cls.intersection({"organizationalunit", "domain", "container"}))
 
     def _is_principal(self, obj_data) -> bool:
@@ -402,6 +415,7 @@ class AclWalk:
         return ("◆", "OBJECT", "obj.other")
 
     def _sort_rights(self, rights):
+        # keep your “dangerous-first” without external sets: heuristic only
         def key(r):
             if r in ("GENERIC_ALL", "FULL_CONTROL", "WRITE_DACL", "WRITE_OWNER"):
                 return (0, r)
@@ -457,13 +471,20 @@ class AclWalk:
                     merged[dn] = {"target_obj": obj, "target_dn": dn, "entries": {}}
 
                 mask = int(ace.get("mask", 0))
-                entry_key = (effect, ace.get("typeName") or "", ace.get("objectTypeName") or "", mask)
+                entry_key = (
+                    effect,
+                    ace.get("typeName") or "",
+                    ace.get("objectTypeName") or "",
+                    ace.get("objectType") or "",
+                    mask,
+                )
 
                 if entry_key not in merged[dn]["entries"]:
                     merged[dn]["entries"][entry_key] = {
                         "effect": effect,
                         "aceType": ace.get("typeName") or "",
                         "objectTypeName": ace.get("objectTypeName"),
+                        "objectType": ace.get("objectType"),
                         "mask": mask,
                         "rights": set(),
                         "sev": severity_from_mask(mask),
@@ -544,17 +565,23 @@ class AclWalk:
             trustee_name = self._obj_name(trustee_obj)
             grouped = []
             for e in self.edges_from_sid(trustee_sid):
-                ace_edges = [
-                    renderer_rich.AceEdge(
-                        source_name=trustee_name,
-                        effect=entry["effect"],
-                        severity=entry["sev"],
-                        mask_hex=f"0x{entry['mask']:08x}",
-                        rights=tuple(entry.get("rights", [])),
-                        object_type=entry.get("objectTypeName"),
+                ace_edges = []
+                for entry in e["entries"]:
+                    raw_objtype = entry.get("objectType") or entry.get("objectTypeName")
+                    resolved = self.resolve_guid(raw_objtype)
+                    friendly = resolved if resolved and resolved != raw_objtype else None
+
+                    ace_edges.append(
+                        renderer_rich.AceEdge(
+                            source_name=trustee_name,
+                            effect=entry["effect"],
+                            severity=entry["sev"],
+                            mask_hex=f"0x{entry['mask']:08x}",
+                            rights=tuple(entry.get("rights", [])),
+                            object_type=raw_objtype,
+                            object_type_name=friendly,
+                        )
                     )
-                    for entry in e["entries"]
-                ]
                 grouped.append((self._to_obj_ref(e["target_obj"]), ace_edges))
             return grouped
 
@@ -653,6 +680,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-targets", type=int, default=30, help="Max targets per trustee shown (0 = no limit)")
     parser.add_argument("--max-children", type=int, default=50, help="Max children listed per container (0 = no limit)")
     parser.add_argument("--max-child-trustees", type=int, default=25, help="Max child SIDs expanded per container (0 = no limit)")
+
     group = parser.add_argument_group("authentication")
     group.add_argument("-hashes", action="store", metavar="LMHASH:NTHASH", help="NTLM hashes LMHASH:NTHASH")
     group.add_argument("-no-pass", action="store_true", help="don't ask for password (useful for -k)")
@@ -669,9 +697,6 @@ if __name__ == "__main__":
 
     options = parser.parse_args()
     logger.init(options.ts, options.debug)
-
-    options.include_deny = True
-    options.include_audit = True
 
     domain, username, password, _, _, options.k = parse_identity(
         options.target, options.hashes, options.no_pass, options.aesKey, options.k
