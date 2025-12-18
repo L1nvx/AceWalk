@@ -28,6 +28,7 @@ class AceEdge:
     mask_hex: str
     rights: Tuple[str, ...]
     object_type: Optional[str] = None
+    object_type_name: Optional[str] = None
 
 
 def default_theme() -> Theme:
@@ -150,12 +151,12 @@ def make_identity_block(obj: ObjRef, dn_max: Optional[int] = None, sid_max: Opti
     return t
 
 
-def make_acl_table(edges: List[AceEdge], rights_max_rows: int = 14, target_guid: Optional[str] = None) -> Table:
-    merged_order: List[Tuple[Tuple[str, str, str, str, Optional[str]], AceEdge]] = []
-    merged_rights: Dict[Tuple[str, str, str, str, Optional[str]], List[str]] = {}
+def make_acl_table(edges: List[AceEdge], rights_max_rows: int = 14) -> Table:
+    merged_order: List[Tuple[Tuple[str, str, str, str, Optional[str], Optional[str]], AceEdge]] = []
+    merged_rights: Dict[Tuple[str, str, str, str, Optional[str], Optional[str]], List[str]] = {}
 
     for e in edges:
-        key = (e.source_name, e.effect, e.severity, e.mask_hex, e.object_type)
+        key = (e.source_name, e.effect, e.severity, e.mask_hex, e.object_type, e.object_type_name)
         if key not in merged_rights:
             merged_rights[key] = list(e.rights)
             merged_order.append((key, e))
@@ -172,17 +173,18 @@ def make_acl_table(edges: List[AceEdge], rights_max_rows: int = 14, target_guid:
             mask_hex=k[3],
             rights=tuple(merged_rights[k]),
             object_type=k[4],
+            object_type_name=k[5],
         )
         for k, e in merged_order
     ]
 
-    t = Table(box=rich_box.SIMPLE, show_header=True, padding=(0, 1))
-    t.add_column("Trustee", style="muted", no_wrap=True)
+    t = Table(box=rich_box.SIMPLE, show_header=True, padding=(0, 1), expand=True)
+    t.add_column("Trustee", style="muted", overflow="fold")
     t.add_column("Eff", no_wrap=True)
     t.add_column("Sev", no_wrap=True)
     t.add_column("Mask", style="dim", no_wrap=True)
     t.add_column("Rights", style="value", overflow="fold")
-    t.add_column("GUID", style="dim", no_wrap=True)
+    t.add_column("GUID", style="dim", overflow="fold", min_width=36)
 
     for e in edges:
         eff_txt = Text(e.effect, style=eff_style(e.effect))
@@ -192,14 +194,18 @@ def make_acl_table(edges: List[AceEdge], rights_max_rows: int = 14, target_guid:
         shown = list(e.rights)[:rights_max_rows]
         for i, r in enumerate(shown):
             st = sev_style(e.severity) if i < 4 else "value"
+            suffix_parts = []
+            if e.object_type_name:
+                suffix_parts.append(e.object_type_name)
+            label = f"{r} ({' / '.join(suffix_parts)})" if suffix_parts else r
             rights_txt.append("• ", style="muted")
-            rights_txt.append(r, style=st)
+            rights_txt.append(label, style=st)
             if i != len(shown) - 1:
                 rights_txt.append("\n")
         if len(e.rights) > rights_max_rows:
             rights_txt.append(f"\n… +{len(e.rights) - rights_max_rows} more", style="muted")
 
-        guid_txt = target_guid or ""
+        guid_txt = e.object_type or ""
         t.add_row(e.source_name, eff_txt, sev_txt, e.mask_hex, rights_txt, guid_txt)
 
     return t
@@ -247,7 +253,7 @@ def object_panel(
     if edges_from_parent:
         main_stack.add_row(
             Panel(
-                make_acl_table(edges_from_parent, target_guid=get_extra("objectGUID")),
+                make_acl_table(edges_from_parent),
                 title=Text("Access (trustees)", style="muted"),
                 border_style="muted",
                 box=ROUNDED,
