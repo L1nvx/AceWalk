@@ -1,4 +1,4 @@
-SCRIPT_VERSION = "0.2.0"
+SCRIPT_VERSION = "0.3.0"
 
 try:
     from impacket import version as impacket_version
