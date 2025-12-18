@@ -7,6 +7,7 @@ import argparse
 import logging
 import sys
 from uuid import UUID
+from collections import defaultdict
 
 from impacket.examples import logger
 from impacket.examples.utils import parse_identity, ldap_login
@@ -113,6 +114,12 @@ def obj_name(obj_dict: dict) -> str:
     return "(unknown)"
 
 
+def dn_parent(dn: str) -> str | None:
+    if not dn or "," not in dn:
+        return None
+    return dn.split(",", 1)[1].strip()
+
+
 def summarize_perms(perms):
     if not perms:
         return "-"
@@ -138,12 +145,28 @@ def resolve_guid_name(guid: str):
     return None
 
 
+def friendly_suffixes(obj_type_guid: str | None, obj_type_name: str | None) -> list[str]:
+    if obj_type_guid:
+        g = obj_type_guid.lower()
+        attr = SCHEMA_OBJECTS.get(g)
+        if attr:
+            return [attr]
+        ext = EXTENDED_RIGHTS.get(g)
+        if ext:
+            return [ext]
+    if obj_type_name:
+        return [obj_type_name]
+    return []
+
+
 def rights_to_names(ace: dict) -> list[str]:
     names = []
     mask = ace.get("Mask", "")
     perms = ace.get("Permissions") or []
     obj_type_guid = ace.get("ObjectType")
     obj_type_name = resolve_guid_name(obj_type_guid)
+    suffixes = friendly_suffixes(obj_type_guid, obj_type_name)
+    suffix_str = " / ".join(suffixes) if suffixes else None
 
     member_guid = "bf9679c0-0de6-11d0-a285-00aa003049e2"
 
@@ -169,10 +192,8 @@ def rights_to_names(ace: dict) -> list[str]:
             names.append("WriteProperty")
 
     if "ADS_RIGHT_DS_CONTROL_ACCESS" in perms:
-        if obj_type_name:
-            names.append(f"ControlAccess({obj_type_name})")
-        elif obj_type_guid:
-            names.append(f"ControlAccess({obj_type_guid})")
+        if suffix_str:
+            names.append(f"ControlAccess({suffix_str})")
         else:
             names.append("ControlAccess")
 
@@ -185,15 +206,11 @@ def rights_to_names(ace: dict) -> list[str]:
     if "ADS_RIGHT_DS_READ_PROP" in perms:
         names.append("ReadProperty")
 
-    # Fallback: include raw permissions if nothing mapped
     if not names:
         names.extend(perms)
 
-    # append object type name/guid context if available
-    if obj_type_name:
-        names = [f"{n} ({obj_type_name})" for n in names]
-    elif obj_type_guid:
-        names = [f"{n} ({obj_type_guid})" for n in names]
+    if suffix_str:
+        names = [f"{n} ({suffix_str})" for n in names]
 
     return names
 
@@ -213,10 +230,11 @@ class AceCollector:
         self.base_dn = ",".join([f"dc={p}" for p in domain.split(".")])
         self.objects = {}
         self.sid_map = {}
+        self.children_index = defaultdict(list)
 
     def collect(self, ldap_conn):
         search_filter = "(nTSecurityDescriptor=*)"
-        attributes = ["distinguishedName", "nTSecurityDescriptor", "objectSid", "objectClass", "sAMAccountName"]
+        attributes = ["distinguishedName", "nTSecurityDescriptor", "objectSid", "objectClass", "sAMAccountName", "memberOf"]
 
         sd_control = ldapasn1.SDFlagsControl(
             criticality=True,
@@ -244,12 +262,18 @@ class AceCollector:
                     try:
                         sid_bytes = bytes(attribute["vals"][0])
                         obj_dict["ObjectSid"] = LDAP_SID(sid_bytes).formatCanonical()
+                        self.sid_map[obj_dict["ObjectSid"]] = dn
                     except Exception:
                         pass
                 elif attr_type == "objectClass":
                     obj_dict["objectClass"] = [str(v).lower() for v in attribute["vals"]]
                 elif attr_type == "sAMAccountName":
                     obj_dict["sAMAccountName"] = str(attribute["vals"][0])
+                elif attr_type == "memberOf":
+                    try:
+                        obj_dict["memberOf"] = [str(v) for v in attribute["vals"]]
+                    except Exception:
+                        obj_dict["memberOf"] = []
                 elif attr_type == "nTSecurityDescriptor" and len(attribute["vals"]) > 0:
                     sd_raw = bytes(attribute["vals"][0])
                     sd = SR_SECURITY_DESCRIPTOR(data=sd_raw)
@@ -259,6 +283,9 @@ class AceCollector:
                             obj_dict["Aces"].append(parse_ace(ace))
 
             self.objects[dn] = obj_dict
+            parent_dn = dn_parent(dn)
+            if parent_dn:
+                self.children_index[parent_dn].append(obj_dict)
 
     def resolve_identity_to_sid(self, ldap_conn, identity: str):
         if identity.startswith("S-1-"):
@@ -323,37 +350,61 @@ class AceCollector:
 
         self.collect(ldap_conn)
 
-        search_sid = self.resolve_identity_to_sid(ldap_conn, self.options.identity)
-        if not search_sid:
+        base_sid = self.resolve_identity_to_sid(ldap_conn, self.options.identity)
+        if not base_sid:
             print(f"[!] Identity '{self.options.identity}' not found")
             return
 
         print(f"[+] Loaded {len(self.objects)} objects with ACEs")
-        print(f"[*] Enumerating ACEs for: {self.options.identity} (SID: {search_sid})")
+        print(f"[*] Enumerating ACEs for: {self.options.identity} (SID: {base_sid})")
 
         rows = []
-        edges = self.edges_from_sid(search_sid)
-        for e in edges:
-            tgt = e["target_obj"]
-            ace = e["ace"]
-            perms_line = "\n".join(rights_to_names(ace))
+        sid_labels = []
+        base_label = self.options.identity
+        base_dn = self.sid_map.get(base_sid)
+        if base_dn and base_dn in self.objects:
+            obj = self.objects[base_dn]
+            base_label = obj.get("sAMAccountName") or base_dn
+            # direct groups
+            for m_dn in obj.get("memberOf", []):
+                m_obj = self.objects.get(m_dn)
+                if m_obj and m_obj.get("ObjectSid"):
+                    label = m_obj.get("sAMAccountName") or m_dn.split(",")[0].replace("CN=", "")
+                    sid_labels.append((m_obj["ObjectSid"], f"group:{label}"))
+            # children (if container/OU/domain)
+            for child in self.children_index.get(base_dn, []):
+                c_sid = child.get("ObjectSid")
+                if c_sid:
+                    c_label = child.get("sAMAccountName") or child.get("DistinguishedName") or "(child)"
+                    sid_labels.append((c_sid, f"child:{c_label}"))
 
-            rows.append(
-                {
-                    "dn": tgt.get("DistinguishedName", ""),
-                    "ace_type": ace.get("TypeName") or "-",
-                    "mask": ace.get("Mask") or "-",
-                    "perms": perms_line,
-                    "obj_type": ace.get("ObjectType") or "-",
-                    "inh_obj_type": ace.get("InheritedObjectType") or "-",
-                }
-            )
+        sid_labels.append((base_sid, base_label))
+
+        for sid, label in sid_labels:
+            edges = self.edges_from_sid(sid)
+            for e in edges:
+                tgt = e["target_obj"]
+                ace = e["ace"]
+                perms_line = "\n".join(rights_to_names(ace))
+
+                rows.append(
+                    {
+                        "who": label,
+                        "dn": tgt.get("DistinguishedName", ""),
+                        "ace_type": ace.get("TypeName") or "-",
+                        "mask": ace.get("Mask") or "-",
+                        "perms": perms_line,
+                        "obj_type": ace.get("ObjectType") or "-",
+                        "inh_obj_type": ace.get("InheritedObjectType") or "-",
+                    }
+                )
 
         if not rows:
             print("[!] No ACEs found for this identity")
             return
 
         headers = [
+            ("Trustee", "who"),
             ("DN", "dn"),
             ("ACE Type", "ace_type"),
             ("Mask", "mask"),
