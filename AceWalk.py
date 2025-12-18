@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 ACLWalk - LDAP ACL graph visualizer (Rich, merged, container-children expansion)
-
-Use only on systems you own or have explicit permission to test.
 """
 
 import version
@@ -136,7 +134,7 @@ class AclWalk:
         self.__kdcIP = cmdLineOptions.dc_ip
         self.__kdcHost = cmdLineOptions.dc_host
 
-        self.__search_identity = cmdLineOptions.search_identity
+        self.__search_identity = cmdLineOptions.identity
         self.__max_depth = getattr(cmdLineOptions, "max_depth", 6)
         self.__no_emoji = False
 
@@ -344,8 +342,6 @@ class AclWalk:
 
         return None
 
-    # ---------- helpers ----------
-
     def _obj_name(self, obj_data):
         display = (obj_data.get("attr") or {}).get("displayName")
         if display:
@@ -415,7 +411,6 @@ class AclWalk:
         return ("◆", "OBJECT", "obj.other")
 
     def _sort_rights(self, rights):
-        # keep your “dangerous-first” without external sets: heuristic only
         def key(r):
             if r in ("GENERIC_ALL", "FULL_CONTROL", "WRITE_DACL", "WRITE_OWNER"):
                 return (0, r)
@@ -426,6 +421,64 @@ class AclWalk:
             return (3, r)
 
         return sorted(set(rights), key=key)
+
+    def _friendly_suffixes(self, obj_type: str | None, obj_type_name: str | None) -> list[str]:
+        if obj_type:
+            g = obj_type.lower()
+            attr = SCHEMA_OBJECTS.get(g)
+            if attr:
+                return [attr]
+            ext = EXTENDED_RIGHTS.get(g)
+            if ext:
+                return [ext]
+        if obj_type_name:
+            return [obj_type_name]
+        return []
+
+    def _friendly_rights(self, rights: list[str], obj_type: str | None, obj_type_name: str | None) -> list[str]:
+        names = []
+        suffixes = self._friendly_suffixes(obj_type, obj_type_name)
+        suffix_str = " / ".join(suffixes) if suffixes else ""
+
+        if "GENERIC_ALL" in rights:
+            names.append("GenericAll")
+            return names
+        if "FULL_CONTROL" in rights:
+            names.append("FullControl")
+        if "GENERIC_WRITE" in rights:
+            names.append("GenericWrite")
+        if "WRITE_DACL" in rights:
+            names.append("WriteDacl")
+        if "WRITE_OWNER" in rights:
+            names.append("WriteOwner")
+        if "DELETE" in rights:
+            names.append("Delete")
+
+        if "ADS_RIGHT_DS_WRITE_PROP" in rights:
+            names.append("WriteProperty")
+
+        if "ADS_RIGHT_DS_CONTROL_ACCESS" in rights:
+            if suffix_str:
+                names.append(f"ControlAccess({suffix_str})")
+            else:
+                names.append("ControlAccess")
+
+        if "ADS_RIGHT_DS_SELF" in rights:
+            names.append("Self")
+        if "ADS_RIGHT_DS_CREATE_CHILD" in rights:
+            names.append("CreateChild")
+        if "ADS_RIGHT_DS_DELETE_CHILD" in rights:
+            names.append("DeleteChild")
+        if "ADS_RIGHT_DS_READ_PROP" in rights:
+            names.append("ReadProperty")
+
+        if not names:
+            names.extend(rights)
+
+        if suffix_str:
+            names = [f"{n} ({suffix_str})" for n in names]
+
+        return names
 
     def _container_control_from_entries(self, entries: list) -> bool:
         """
@@ -568,8 +621,9 @@ class AclWalk:
                 ace_edges = []
                 for entry in e["entries"]:
                     raw_objtype = entry.get("objectType") or entry.get("objectTypeName")
-                    resolved = self.resolve_guid(raw_objtype)
-                    friendly = resolved if resolved and resolved != raw_objtype else None
+                    suffixes = self._friendly_suffixes(entry.get("objectType"), entry.get("objectTypeName"))
+                    suffix_str = " / ".join(suffixes) if suffixes else None
+                    friendly_rights = self._friendly_rights(entry.get("rights", []) or [], entry.get("objectType"), entry.get("objectTypeName"))
 
                     ace_edges.append(
                         renderer_rich.AceEdge(
@@ -577,9 +631,9 @@ class AclWalk:
                             effect=entry["effect"],
                             severity=entry["sev"],
                             mask_hex=f"0x{entry['mask']:08x}",
-                            rights=tuple(entry.get("rights", [])),
+                            rights=tuple(friendly_rights),
                             object_type=raw_objtype,
-                            object_type_name=friendly,
+                            object_type_name=suffix_str,
                         )
                     )
                 grouped.append((self._to_obj_ref(e["target_obj"]), ace_edges))
@@ -666,10 +720,10 @@ if __name__ == "__main__":
     parser.add_argument("target", action="store", help="[[domain/]username[:password]]")
 
     parser.add_argument(
-        "--search-identity",
+        "-identity",
         required=True,
         action="store",
-        metavar="IDENTITY",
+        metavar="identity",
         help="Identity to search (sAMAccountName, DN, or SID) [REQUIRED]",
     )
 
