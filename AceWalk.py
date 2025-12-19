@@ -114,6 +114,17 @@ def effect_rank(effect: str) -> int:
     return {"DENY": 0, "ALLOW": 1, "AUDIT": 2, "OTHER": 3}.get(effect, 4)
 
 
+def resolve_guid_name(guid: str | None):
+    if not guid:
+        return None
+    g = guid.lower()
+    if g in SCHEMA_OBJECTS:
+        return SCHEMA_OBJECTS[g]
+    if g in EXTENDED_RIGHTS:
+        return EXTENDED_RIGHTS[g]
+    return None
+
+
 def dn_parent(dn: str) -> str | None:
     if not dn or "," not in dn:
         return None
@@ -138,7 +149,6 @@ class AclWalk:
         self.__max_depth = getattr(cmdLineOptions, "max_depth", 6)
         self.__no_emoji = False
 
-        # Limits to keep output sane
         raw_max_targets = getattr(cmdLineOptions, "max_targets", 30)
         self.__max_targets = raw_max_targets if raw_max_targets and raw_max_targets > 0 else None
 
@@ -148,7 +158,6 @@ class AclWalk:
         raw_max_child_trustees = getattr(cmdLineOptions, "max_child_trustees", 25)
         self.__max_child_trustees = raw_max_child_trustees if raw_max_child_trustees and raw_max_child_trustees > 0 else None
 
-        # Policy
         self.__include_deny = True
         self.__include_audit = True
         self.__only_expand_principals = False
@@ -215,7 +224,7 @@ class AclWalk:
         }
 
     def load_all_objects(self, ldapConnection):
-        logging.info("Loading all objects and ACEs from LDAP...")
+        logging.debug("Loading all objects and ACEs from LDAP...")
 
         searchFilter = "(nTSecurityDescriptor=*)"
         attributes = [
@@ -243,7 +252,7 @@ class AclWalk:
             searchControls=[sd_control],
         )
 
-        logging.info(f"Total records returned: {len(resp)}")
+        logging.debug(f"Total records returned: {len(resp)}")
 
         for item in resp:
             if not isinstance(item, ldapasn1.SearchResultEntry):
@@ -301,17 +310,15 @@ class AclWalk:
 
             self.objects[dn] = obj_data
 
-        # Build children index (one-level)
         for dn, obj in self.objects.items():
             p = dn_parent(dn)
             if p:
                 self.children_index[p].append(obj)
 
-        # Sort children nicely
         for p, lst in self.children_index.items():
             lst.sort(key=lambda o: (self._type_order(o), self._obj_name(o).lower()))
 
-        logging.info(f"Loaded {len(self.objects)} objects with ACEs")
+        logging.debug(f"Loaded {len(self.objects)} objects with ACEs")
 
     def resolve_identity_to_sid(self, ldapConnection, identity):
         if identity.startswith("S-1-"):
@@ -358,7 +365,6 @@ class AclWalk:
 
     def _is_container(self, obj_data) -> bool:
         cls = set(obj_data.get("objectClass", []))
-        # conservative: OU/domain/container
         return bool(cls.intersection({"organizationalunit", "domain", "container"}))
 
     def _is_principal(self, obj_data) -> bool:
@@ -378,6 +384,198 @@ class AclWalk:
         if "computer" in cls:
             return 4
         return 9
+
+    def _entry_type(self, obj_data) -> str | None:
+        classes = set(obj_data.get("objectClass", []))
+        if "user" in classes:
+            return "user"
+        if "group" in classes:
+            return "group"
+        if "computer" in classes:
+            return "computer"
+        if "organizationalunit" in classes:
+            return "organizational-unit"
+        if "grouppolicycontainer" in classes:
+            return "gpo"
+        if "domain" in classes or "domaindns" in classes:
+            return "domain"
+        return None
+
+    def _resolve_objtype_display(self, obj_type: str | None, obj_type_name: str | None) -> str | None:
+        resolved = resolve_guid_name(obj_type)
+        if resolved:
+            return resolved
+        if obj_type_name:
+            return obj_type_name
+        return None
+
+    def _rights_to_names(
+        self,
+        rights: list[str],
+        target_obj: dict,
+        ace_type: int | None,
+        obj_type_guid: str | None,
+        obj_type_name: str | None,
+    ) -> list[str]:
+        """
+        Human-friendly rights mapping (matches acewalkv1.py), including attribute/extended right names in parentheses.
+        """
+        names: list[str] = []
+        perms = rights or []
+        entry_type = self._entry_type(target_obj)
+
+        obj_type_display = self._resolve_objtype_display(obj_type_guid, obj_type_name)
+        obj_guid_lower = obj_type_guid.lower() if obj_type_guid else None
+
+        GUID_WRITE_MEMBER = "bf9679c0-0de6-11d0-a285-00aa003049e2"
+        GUID_USER_FORCE_CHANGE_PASSWORD = "00299570-246d-11d0-a768-00aa006e0529"
+        GUID_ALLOWED_TO_ACT = "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79"
+        GUID_GET_CHANGES = "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"
+        GUID_GET_CHANGES_ALL = "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
+        GUID_GET_CHANGES_FILTERED = "89e95b76-444d-4c62-991a-0facbeda640c"
+        GUID_SPN = "f3a64788-5306-11d1-a9c5-0000f80367c1"
+        GUID_KEY_CREDENTIAL_LINK = "5b47d60f-6090-40b2-9f37-2a4de88f3063"
+        GUID_WRITE_GPLINK = "f30e3bbe-9ff0-11d1-b603-0000f80367c1"
+        GUID_USER_ACCOUNT_RESTRICTIONS = "4c164200-20c0-11d0-a768-00aa006e0529"
+
+        if "GENERIC_ALL" in perms or "FULL_CONTROL" in perms:
+            if ace_type in ACE_WITH_OBJECTTYPE and obj_guid_lower:
+                pass
+            else:
+                names.append("GenericAll")
+                return names
+
+        if "GENERIC_WRITE" in perms:
+            names.append("GenericWrite")
+            if entry_type not in ["domain", "computer"]:
+                return names
+
+        if "WRITE_DACL" in perms:
+            names.append("WriteDacl")
+
+        if "WRITE_OWNER" in perms:
+            names.append("WriteOwner")
+
+        if "ADS_RIGHT_DS_WRITE_PROP" in perms:
+            if not obj_type_guid and entry_type in ["user", "group", "computer", "gpo", "organizational-unit"]:
+                if "GenericWrite" not in names:
+                    names.append("GenericWrite")
+            elif entry_type == "group" and obj_guid_lower == GUID_WRITE_MEMBER:
+                if obj_type_display:
+                    names.append(f"AddMember ({obj_type_display})")
+                else:
+                    names.append("AddMember")
+            elif entry_type == "computer" and obj_guid_lower == GUID_ALLOWED_TO_ACT:
+                if obj_type_display:
+                    names.append(f"AddAllowedToAct ({obj_type_display})")
+                else:
+                    names.append("AddAllowedToAct")
+            elif entry_type in ["user", "computer"] and obj_guid_lower == GUID_USER_ACCOUNT_RESTRICTIONS:
+                if obj_type_display:
+                    names.append(f"WriteAccountRestrictions ({obj_type_display})")
+                else:
+                    names.append("WriteAccountRestrictions")
+            elif entry_type == "organizational-unit" and obj_guid_lower == GUID_WRITE_GPLINK:
+                if obj_type_display:
+                    names.append(f"WriteGPLink ({obj_type_display})")
+                else:
+                    names.append("WriteGPLink")
+            elif entry_type in ["user", "computer"] and obj_guid_lower == GUID_KEY_CREDENTIAL_LINK:
+                if obj_type_display:
+                    names.append(f"AddKeyCredentialLink ({obj_type_display})")
+                else:
+                    names.append("AddKeyCredentialLink")
+            elif entry_type in ["user", "computer"] and obj_guid_lower == GUID_SPN:
+                if obj_type_display:
+                    names.append(f"WriteSPN ({obj_type_display})")
+                else:
+                    names.append("WriteSPN")
+            elif obj_type_display:
+                names.append(f"WriteProperty ({obj_type_display})")
+            else:
+                names.append("WriteProperty")
+
+        if "ADS_RIGHT_DS_SELF" in perms:
+            if entry_type == "group" and obj_guid_lower == GUID_WRITE_MEMBER:
+                if obj_type_display:
+                    names.append(f"AddSelf ({obj_type_display})")
+                else:
+                    names.append("AddSelf")
+            elif obj_type_display:
+                names.append(f"Self ({obj_type_display})")
+            else:
+                names.append("Self")
+
+        if "ADS_RIGHT_DS_CONTROL_ACCESS" in perms:
+            if not obj_type_guid:
+                if entry_type in ["user", "domain", "computer"]:
+                    names.append("AllExtendedRights")
+            else:
+                if entry_type in ["user", "computer"] and obj_guid_lower == GUID_USER_FORCE_CHANGE_PASSWORD:
+                    if obj_type_display:
+                        names.append(f"ForceChangePassword ({obj_type_display})")
+                    else:
+                        names.append("ForceChangePassword")
+                elif entry_type == "domain":
+                    if obj_guid_lower == GUID_GET_CHANGES:
+                        if obj_type_display:
+                            names.append(f"GetChanges ({obj_type_display})")
+                        else:
+                            names.append("GetChanges")
+                    elif obj_guid_lower == GUID_GET_CHANGES_ALL:
+                        if obj_type_display:
+                            names.append(f"GetChangesAll ({obj_type_display})")
+                        else:
+                            names.append("GetChangesAll")
+                    elif obj_guid_lower == GUID_GET_CHANGES_FILTERED:
+                        if obj_type_display:
+                            names.append(f"GetChangesInFilteredSet ({obj_type_display})")
+                        else:
+                            names.append("GetChangesInFilteredSet")
+                    elif obj_type_display:
+                        names.append(f"ExtendedRight ({obj_type_display})")
+                    else:
+                        names.append("ExtendedRight")
+                elif obj_type_display:
+                    names.append(f"ExtendedRight ({obj_type_display})")
+                else:
+                    names.append("ExtendedRight")
+
+        if "ADS_RIGHT_DS_READ_PROP" in perms:
+            if entry_type == "computer" and "ADS_RIGHT_DS_CONTROL_ACCESS" in perms:
+                laps_guids = [
+                    "ms-mcs-admpwd",
+                    "ms-laps-password",
+                    "ms-laps-encryptedpassword",
+                ]
+                if obj_type_display and obj_type_display.lower() in laps_guids:
+                    names.append(f"ReadLAPSPassword ({obj_type_display})")
+
+            if not names:
+                if obj_type_display:
+                    names.append(f"ReadProperty ({obj_type_display})")
+                else:
+                    names.append("ReadProperty")
+
+        if "ADS_RIGHT_DS_CREATE_CHILD" in perms:
+            if obj_type_display:
+                names.append(f"CreateChild ({obj_type_display})")
+            else:
+                names.append("CreateChild")
+
+        if "ADS_RIGHT_DS_DELETE_CHILD" in perms:
+            if obj_type_display:
+                names.append(f"DeleteChild ({obj_type_display})")
+            else:
+                names.append("DeleteChild")
+
+        if "DELETE" in perms:
+            names.append("Delete")
+
+        if not names:
+            names = [p for p in perms if p not in ["READ_CONTROL", "SYNCHRONIZE"]]
+
+        return names if names else ["-"]
 
     def _icon_type_style(self, obj_data):
         cls = obj_data.get("objectClass", [])
@@ -421,64 +619,6 @@ class AclWalk:
             return (3, r)
 
         return sorted(set(rights), key=key)
-
-    def _friendly_suffixes(self, obj_type: str | None, obj_type_name: str | None) -> list[str]:
-        if obj_type:
-            g = obj_type.lower()
-            attr = SCHEMA_OBJECTS.get(g)
-            if attr:
-                return [attr]
-            ext = EXTENDED_RIGHTS.get(g)
-            if ext:
-                return [ext]
-        if obj_type_name:
-            return [obj_type_name]
-        return []
-
-    def _friendly_rights(self, rights: list[str], obj_type: str | None, obj_type_name: str | None) -> list[str]:
-        names = []
-        suffixes = self._friendly_suffixes(obj_type, obj_type_name)
-        suffix_str = " / ".join(suffixes) if suffixes else ""
-
-        if "GENERIC_ALL" in rights:
-            names.append("GenericAll")
-            return names
-        if "FULL_CONTROL" in rights:
-            names.append("FullControl")
-        if "GENERIC_WRITE" in rights:
-            names.append("GenericWrite")
-        if "WRITE_DACL" in rights:
-            names.append("WriteDacl")
-        if "WRITE_OWNER" in rights:
-            names.append("WriteOwner")
-        if "DELETE" in rights:
-            names.append("Delete")
-
-        if "ADS_RIGHT_DS_WRITE_PROP" in rights:
-            names.append("WriteProperty")
-
-        if "ADS_RIGHT_DS_CONTROL_ACCESS" in rights:
-            if suffix_str:
-                names.append(f"ControlAccess({suffix_str})")
-            else:
-                names.append("ControlAccess")
-
-        if "ADS_RIGHT_DS_SELF" in rights:
-            names.append("Self")
-        if "ADS_RIGHT_DS_CREATE_CHILD" in rights:
-            names.append("CreateChild")
-        if "ADS_RIGHT_DS_DELETE_CHILD" in rights:
-            names.append("DeleteChild")
-        if "ADS_RIGHT_DS_READ_PROP" in rights:
-            names.append("ReadProperty")
-
-        if not names:
-            names.extend(rights)
-
-        if suffix_str:
-            names = [f"{n} ({suffix_str})" for n in names]
-
-        return names
 
     def _container_control_from_entries(self, entries: list) -> bool:
         """
@@ -536,6 +676,7 @@ class AclWalk:
                     merged[dn]["entries"][entry_key] = {
                         "effect": effect,
                         "aceType": ace.get("typeName") or "",
+                        "aceTypeId": ace.get("type"),
                         "objectTypeName": ace.get("objectTypeName"),
                         "objectType": ace.get("objectType"),
                         "mask": mask,
@@ -621,9 +762,14 @@ class AclWalk:
                 ace_edges = []
                 for entry in e["entries"]:
                     raw_objtype = entry.get("objectType") or entry.get("objectTypeName")
-                    suffixes = self._friendly_suffixes(entry.get("objectType"), entry.get("objectTypeName"))
-                    suffix_str = " / ".join(suffixes) if suffixes else None
-                    friendly_rights = self._friendly_rights(entry.get("rights", []) or [], entry.get("objectType"), entry.get("objectTypeName"))
+                    obj_type_name = self._resolve_objtype_display(entry.get("objectType"), entry.get("objectTypeName"))
+                    friendly_rights = self._rights_to_names(
+                        entry.get("rights", []) or [],
+                        e["target_obj"],
+                        entry.get("aceTypeId"),
+                        entry.get("objectType"),
+                        entry.get("objectTypeName"),
+                    )
 
                     ace_edges.append(
                         renderer_rich.AceEdge(
@@ -633,7 +779,7 @@ class AclWalk:
                             mask_hex=f"0x{entry['mask']:08x}",
                             rights=tuple(friendly_rights),
                             object_type=raw_objtype,
-                            object_type_name=suffix_str,
+                            object_type_name=obj_type_name,
                         )
                     )
                 grouped.append((self._to_obj_ref(e["target_obj"]), ace_edges))
@@ -706,8 +852,8 @@ class AclWalk:
             logging.error(f"Identity '{self.__search_identity}' not found or could not be resolved")
             return
 
-        logging.info(f"Searching ACL tree for: {self.__search_identity} (SID: {target_sid})")
-        logging.info(f"Maximum depth: {self.__max_depth}")
+        logging.debug(f"Searching ACL tree for: {self.__search_identity} (SID: {target_sid})")
+        logging.debug(f"Maximum depth: {self.__max_depth}")
 
         self.print_tree_rich(target_sid)
 
