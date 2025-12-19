@@ -8,13 +8,15 @@ import logging
 import sys
 from uuid import UUID
 from collections import defaultdict
+import textwrap
+import version
 
 from impacket.examples import logger
 from impacket.examples.utils import parse_identity, ldap_login
 from impacket.ldap import ldap, ldapasn1
 from impacket.ldap.ldaptypes import LDAP_SID, LDAP_SERVER_SD_FLAGS, SR_SECURITY_DESCRIPTOR
 from impacket.msada_guids import SCHEMA_OBJECTS, EXTENDED_RIGHTS
-import version
+import impacket
 
 
 ACCESS_FLAGS = {
@@ -120,99 +122,222 @@ def dn_parent(dn: str) -> str | None:
     return dn.split(",", 1)[1].strip()
 
 
-def summarize_perms(perms):
-    if not perms:
-        return "-"
-    if "GENERIC_ALL" in perms:
-        return "GENERIC_ALL"
-    if "FULL_CONTROL" in perms:
-        return "FULL_CONTROL"
-    if "GENERIC_WRITE" in perms:
-        return "GENERIC_WRITE"
-    if "ADS_RIGHT_DS_CONTROL_ACCESS" in perms:
-        return "DS_CONTROL_ACCESS"
-    return "\n".join(perms)
-
-
 def resolve_guid_name(guid: str):
     if not guid:
         return None
     g = guid.lower()
-    if g in EXTENDED_RIGHTS:
-        return EXTENDED_RIGHTS[g]
     if g in SCHEMA_OBJECTS:
         return SCHEMA_OBJECTS[g]
+    if g in EXTENDED_RIGHTS:
+        return EXTENDED_RIGHTS[g]
     return None
 
 
-def friendly_suffixes(obj_type_guid: str | None, obj_type_name: str | None) -> list[str]:
-    if obj_type_guid:
-        g = obj_type_guid.lower()
-        attr = SCHEMA_OBJECTS.get(g)
-        if attr:
-            return [attr]
-        ext = EXTENDED_RIGHTS.get(g)
-        if ext:
-            return [ext]
-    if obj_type_name:
-        return [obj_type_name]
-    return []
-
-
-def rights_to_names(ace: dict) -> list[str]:
+def rights_to_names(ace: dict, target_obj: dict) -> list[str]:
+    """
+    Convierte ACE a nombres descriptivos similares a BloodHound.
+    Incluye el nombre del atributo/derecho entre paréntesis cuando es relevante.
+    """
     names = []
-    mask = ace.get("Mask", "")
     perms = ace.get("Permissions") or []
     obj_type_guid = ace.get("ObjectType")
-    obj_type_name = resolve_guid_name(obj_type_guid)
-    suffixes = friendly_suffixes(obj_type_guid, obj_type_name)
-    suffix_str = " / ".join(suffixes) if suffixes else None
+    ace_type = ace.get("AceType")
+    obj_type_name = resolve_guid_name(obj_type_guid) if obj_type_guid else None
 
-    member_guid = "bf9679c0-0de6-11d0-a285-00aa003049e2"
+    obj_classes = target_obj.get("objectClass", [])
+    entry_type = None
+    if "user" in obj_classes:
+        entry_type = "user"
+    elif "group" in obj_classes:
+        entry_type = "group"
+    elif "computer" in obj_classes:
+        entry_type = "computer"
+    elif "organizationalunit" in obj_classes:
+        entry_type = "organizational-unit"
+    elif "grouppolicycontainer" in obj_classes:
+        entry_type = "gpo"
+    elif "domain" in obj_classes or "domaindns" in obj_classes:
+        entry_type = "domain"
+    GUID_WRITE_MEMBER = "bf9679c0-0de6-11d0-a285-00aa003049e2"
+    GUID_USER_FORCE_CHANGE_PASSWORD = "00299570-246d-11d0-a768-00aa006e0529"
+    GUID_ALLOWED_TO_ACT = "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79"
+    GUID_GET_CHANGES = "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"
+    GUID_GET_CHANGES_ALL = "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"
+    GUID_GET_CHANGES_FILTERED = "89e95b76-444d-4c62-991a-0facbeda640c"
+    GUID_SPN = "f3a64788-5306-11d1-a9c5-0000f80367c1"
+    GUID_KEY_CREDENTIAL_LINK = "5b47d60f-6090-40b2-9f37-2a4de88f3063"
+    GUID_WRITE_GPLINK = "f30e3bbe-9ff0-11d1-b603-0000f80367c1"
+    GUID_USER_ACCOUNT_RESTRICTIONS = "4c164200-20c0-11d0-a768-00aa006e0529"
+    
+    obj_guid_lower = obj_type_guid.lower() if obj_type_guid else None
 
-    if "GENERIC_ALL" in perms:
-        names.append("GenericAll")
-        return names
-    if "FULL_CONTROL" in perms:
-        names.append("FullControl")
+    if "GENERIC_ALL" in perms or "FULL_CONTROL" in perms:
+        if ace_type in ACE_WITH_OBJECTTYPE and obj_guid_lower:
+            pass
+        else:
+            names.append("GenericAll")
+            return names
 
     if "GENERIC_WRITE" in perms:
         names.append("GenericWrite")
+        if entry_type not in ["domain", "computer"]:
+            return names
+
     if "WRITE_DACL" in perms:
         names.append("WriteDacl")
+
     if "WRITE_OWNER" in perms:
         names.append("WriteOwner")
-    if "DELETE" in perms:
-        names.append("Delete")
 
     if "ADS_RIGHT_DS_WRITE_PROP" in perms:
-        if obj_type_guid and obj_type_guid.lower() == member_guid:
-            names.append("AddMember")
+        if not obj_type_guid and entry_type in ['user', 'group', 'computer', 'gpo', 'organizational-unit']:
+            if "GenericWrite" not in names:
+                names.append("GenericWrite")
+        
+        elif entry_type == "group" and obj_guid_lower == GUID_WRITE_MEMBER:
+            if obj_type_name:
+                names.append(f"AddMember ({obj_type_name})")
+            else:
+                names.append("AddMember")
+        
+        elif entry_type == "computer" and obj_guid_lower == GUID_ALLOWED_TO_ACT:
+            if obj_type_name:
+                names.append(f"AddAllowedToAct ({obj_type_name})")
+            else:
+                names.append("AddAllowedToAct")
+        
+        elif entry_type in ["user", "computer"] and obj_guid_lower == GUID_USER_ACCOUNT_RESTRICTIONS:
+            if obj_type_name:
+                names.append(f"WriteAccountRestrictions ({obj_type_name})")
+            else:
+                names.append("WriteAccountRestrictions")
+        
+        elif entry_type == "organizational-unit" and obj_guid_lower == GUID_WRITE_GPLINK:
+            if obj_type_name:
+                names.append(f"WriteGPLink ({obj_type_name})")
+            else:
+                names.append("WriteGPLink")
+        
+        elif entry_type in ["user", "computer"] and obj_guid_lower == GUID_KEY_CREDENTIAL_LINK:
+            if obj_type_name:
+                names.append(f"AddKeyCredentialLink ({obj_type_name})")
+            else:
+                names.append("AddKeyCredentialLink")
+        
+        elif entry_type in ["user", "computer"] and obj_guid_lower == GUID_SPN:
+            if obj_type_name:
+                names.append(f"WriteSPN ({obj_type_name})")
+            else:
+                names.append("WriteSPN")
+        
+        elif obj_type_name:
+            names.append(f"WriteProperty ({obj_type_name})")
         else:
             names.append("WriteProperty")
 
-    if "ADS_RIGHT_DS_CONTROL_ACCESS" in perms:
-        if suffix_str:
-            names.append(f"ControlAccess({suffix_str})")
-        else:
-            names.append("ControlAccess")
-
     if "ADS_RIGHT_DS_SELF" in perms:
-        names.append("Self")
-    if "ADS_RIGHT_DS_CREATE_CHILD" in perms:
-        names.append("CreateChild")
-    if "ADS_RIGHT_DS_DELETE_CHILD" in perms:
-        names.append("DeleteChild")
+        if entry_type == "group" and obj_guid_lower == GUID_WRITE_MEMBER:
+            if obj_type_name:
+                names.append(f"AddSelf ({obj_type_name})")
+            else:
+                names.append("AddSelf")
+        elif obj_type_name:
+            names.append(f"Self ({obj_type_name})")
+        else:
+            names.append("Self")
+
+    if "ADS_RIGHT_DS_CONTROL_ACCESS" in perms:
+        if not obj_type_guid:
+            if entry_type in ["user", "domain", "computer"]:
+                names.append("AllExtendedRights")
+        else:
+            if entry_type in ["user", "computer"] and obj_guid_lower == GUID_USER_FORCE_CHANGE_PASSWORD:
+                if obj_type_name:
+                    names.append(f"ForceChangePassword ({obj_type_name})")
+                else:
+                    names.append("ForceChangePassword")
+            
+            elif entry_type == "domain":
+                if obj_guid_lower == GUID_GET_CHANGES:
+                    if obj_type_name:
+                        names.append(f"GetChanges ({obj_type_name})")
+                    else:
+                        names.append("GetChanges")
+                elif obj_guid_lower == GUID_GET_CHANGES_ALL:
+                    if obj_type_name:
+                        names.append(f"GetChangesAll ({obj_type_name})")
+                    else:
+                        names.append("GetChangesAll")
+                elif obj_guid_lower == GUID_GET_CHANGES_FILTERED:
+                    if obj_type_name:
+                        names.append(f"GetChangesInFilteredSet ({obj_type_name})")
+                    else:
+                        names.append("GetChangesInFilteredSet")
+                elif obj_type_name:
+                    names.append(f"ExtendedRight ({obj_type_name})")
+                else:
+                    names.append("ExtendedRight")
+            
+            elif obj_type_name:
+                names.append(f"ExtendedRight ({obj_type_name})")
+            else:
+                names.append("ExtendedRight")
+
     if "ADS_RIGHT_DS_READ_PROP" in perms:
-        names.append("ReadProperty")
+        if entry_type == "computer" and "ADS_RIGHT_DS_CONTROL_ACCESS" in perms:
+            LAPS_GUIDS = [
+                "ms-mcs-admpwd",
+                "ms-laps-password", 
+                "ms-laps-encryptedpassword"
+            ]
+            if obj_type_name and obj_type_name.lower() in LAPS_GUIDS:
+                names.append(f"ReadLAPSPassword ({obj_type_name})")
+        
+        if not names:
+            if obj_type_name:
+                names.append(f"ReadProperty ({obj_type_name})")
+            else:
+                names.append("ReadProperty")
+
+    if "ADS_RIGHT_DS_CREATE_CHILD" in perms:
+        if obj_type_name:
+            names.append(f"CreateChild ({obj_type_name})")
+        else:
+            names.append("CreateChild")
+    
+    if "ADS_RIGHT_DS_DELETE_CHILD" in perms:
+        if obj_type_name:
+            names.append(f"DeleteChild ({obj_type_name})")
+        else:
+            names.append("DeleteChild")
+    
+    if "DELETE" in perms:
+        names.append("Delete")
 
     if not names:
-        names.extend(perms)
+        names = [p for p in perms if p not in ["READ_CONTROL", "SYNCHRONIZE"]]
+    
+    return names if names else ["-"]
 
-    if suffix_str:
-        names = [f"{n} ({suffix_str})" for n in names]
+def wrap_cell(value: str, width: int) -> list[str]:
+    """
+    Wrap a single cell to the given width, padding each line so table columns stay aligned.
+    """
+    text = "-" if value is None or str(value) == "" else str(value)
+    wrapped = textwrap.wrap(text, width=width) or [""]
+    return [line.ljust(width) for line in wrapped]
 
-    return names
+
+def wrap_rights(rights: list[str], width: int) -> list[str]:
+    """
+    Wrap each right and flatten into a single list so multiple rights render on separate lines.
+    """
+    if not rights:
+        rights = ["-"]
+    lines: list[str] = []
+    for r in rights:
+        lines.extend(wrap_cell(r, width))
+    return lines
 
 
 class AceCollector:
@@ -348,122 +473,137 @@ class AceCollector:
             self.options.aesKey,
         )
 
+        logging.debug(f"Collecting objects from {self.base_dn}...")
         self.collect(ldap_conn)
 
         base_sid = self.resolve_identity_to_sid(ldap_conn, self.options.identity)
         if not base_sid:
-            print(f"[!] Identity '{self.options.identity}' not found")
+            logging.error(f"Identity '{self.options.identity}' not found")
             return
 
-        print(f"[+] Loaded {len(self.objects)} objects with ACEs")
-        print(f"[*] Enumerating ACEs for: {self.options.identity} (SID: {base_sid})")
+        logging.debug(f"Loaded {len(self.objects)} objects with ACEs")
+        logging.debug(f"Enumerating ACEs for: {self.options.identity} (SID: {base_sid})")
 
         rows = []
         sid_labels = []
         base_label = self.options.identity
         base_dn = self.sid_map.get(base_sid)
+        
         if base_dn and base_dn in self.objects:
             obj = self.objects[base_dn]
             base_label = obj.get("sAMAccountName") or base_dn
-            # direct groups
+            
+            sid_labels.append((base_sid, f"DIRECT", base_label))
+            
+            logging.debug("Checking group memberships...")
             for m_dn in obj.get("memberOf", []):
                 m_obj = self.objects.get(m_dn)
                 if m_obj and m_obj.get("ObjectSid"):
                     label = m_obj.get("sAMAccountName") or m_dn.split(",")[0].replace("CN=", "")
-                    sid_labels.append((m_obj["ObjectSid"], f"group:{label}"))
-            # children (if container/OU/domain)
-            for child in self.children_index.get(base_dn, []):
-                c_sid = child.get("ObjectSid")
-                if c_sid:
-                    c_label = child.get("sAMAccountName") or child.get("DistinguishedName") or "(child)"
-                    sid_labels.append((c_sid, f"child:{c_label}"))
+                    sid_labels.append((m_obj["ObjectSid"], "GROUP", label))
+            
+            children = self.children_index.get(base_dn, [])
+            if children:
+                logging.debug(f"Checking children objects ({len(children)} found)...")
+                for child in children:
+                    c_sid = child.get("ObjectSid")
+                    if c_sid:
+                        c_label = child.get("sAMAccountName") or child.get("DistinguishedName", "").split(",")[0].replace("CN=", "")
+                        sid_labels.append((c_sid, "CHILD", c_label))
+        else:
+            sid_labels.append((base_sid, "DIRECT", base_label))
 
-        sid_labels.append((base_sid, base_label))
-
-        for sid, label in sid_labels:
+        logging.debug(f"Searching ACEs for {len(sid_labels)} identities (direct + groups + children)...")
+        
+        for sid, relation_type, label in sid_labels:
             edges = self.edges_from_sid(sid)
             for e in edges:
                 tgt = e["target_obj"]
                 ace = e["ace"]
-                perms_line = "\n".join(rights_to_names(ace))
+                rights_list = rights_to_names(ace, tgt)
+                
+                obj_type_guid = ace.get("ObjectType")
+                obj_type_display = resolve_guid_name(obj_type_guid) if obj_type_guid else "-"
+                
+                inh_obj_type_guid = ace.get("InheritedObjectType")
+                inh_obj_type_display = resolve_guid_name(inh_obj_type_guid) if inh_obj_type_guid else "-"
 
-                rows.append(
-                    {
-                        "who": label,
-                        "dn": tgt.get("DistinguishedName", ""),
+                row_data = {
+                    "relation": relation_type,
+                    "who": label,
+                    "dn": tgt.get("DistinguishedName", ""),
+                    "rights": rights_list,
+                }
+                
+                if self.options.extended:
+                    row_data.update({
+                        "obj_type": obj_type_guid,
                         "ace_type": ace.get("TypeName") or "-",
                         "mask": ace.get("Mask") or "-",
-                        "perms": perms_line,
-                        "obj_type": ace.get("ObjectType") or "-",
-                        "inh_obj_type": ace.get("InheritedObjectType") or "-",
-                    }
-                )
+                        "inh_obj_type": inh_obj_type_display,
+                    })
+                
+                rows.append(row_data)
 
         if not rows:
-            print("[!] No ACEs found for this identity")
+            logging.warning("No ACEs found for this identity (including groups and children)")
             return
 
-        headers = [
-            ("Trustee", "who"),
-            ("DN", "dn"),
-            ("ACE Type", "ace_type"),
-            ("Mask", "mask"),
-            ("Perms", "perms"),
-            ("ObjectType", "obj_type"),
-            ("InheritedObjType", "inh_obj_type"),
-        ]
+        if self.options.extended:
+            headers = [
+                ("Relation", "relation", 10),
+                ("Trustee", "who", 20),
+                ("Target DN", "dn", 50),
+                ("Rights", "rights", 40),
+                ("ObjectType", "obj_type", 30),
+                ("ACE Type", "ace_type", 30),
+                ("Mask", "mask", 12),
+                ("InheritedObjType", "inh_obj_type", 30),
+            ]
+        else:
+            headers = [
+                ("Relation", "relation", 10),
+                ("Trustee", "who", 20),
+                ("Target DN", "dn", 60),
+                ("Rights", "rights", 50),
+            ]
 
-        col_widths = {}
-        for title, key in headers:
-            max_len = len(title)
-            for r in rows:
-                # For perms, account for multi-line content
-                if key == "perms":
-                    lines = str(r.get(key, "")).split("\n")
-                    for ln in lines:
-                        if len(ln) > max_len:
-                            max_len = len(ln)
-                else:
-                    v = str(r.get(key, ""))
-                    if len(v) > max_len:
-                        max_len = len(v)
-            col_widths[key] = max_len
-
-        def fmt(val, key):
-            s = str(val)
-            return s.ljust(col_widths[key])
-
-        header_line = "  ".join(fmt(title, key) for title, key in headers)
-        sep_line = "-" * len(header_line)
+        header_line = "  ".join(title.ljust(width) for title, _, width in headers)
+        sep_line = "  ".join("-" * width for _, _, width in headers)
+        
         print(header_line)
         print(sep_line)
 
         for r in rows:
-            perms_lines = str(r.get("perms", "")).split("\n")
-            base_parts = []
-            for title, key in headers:
-                if key == "perms":
-                    base_parts.append(fmt(perms_lines[0], key))
+            column_lines = []
+            for _, key, width in headers:
+                if key == "rights":
+                    column_lines.append((wrap_rights(r.get("rights", []), width), width))
                 else:
-                    base_parts.append(fmt(r.get(key, ""), key))
-            print("  ".join(base_parts))
+                    column_lines.append((wrap_cell(r.get(key, ""), width), width))
 
-            if len(perms_lines) > 1:
-                for extra in perms_lines[1:]:
-                    extra_parts = []
-                    for title, key in headers:
-                        if key == "perms":
-                            extra_parts.append(fmt(extra, key))
-                        else:
-                            extra_parts.append(" " * col_widths[key])
-                    print("  ".join(extra_parts))
+            max_lines = max(len(lines) for lines, _ in column_lines)
+
+            for line_idx in range(max_lines):
+                parts = []
+                for lines, width in column_lines:
+                    if line_idx < len(lines):
+                        parts.append(lines[line_idx])
+                    else:
+                        parts.append(" " * width)
+                print("  ".join(parts))
+        
+        print("")
 
 
 def main():
     print(version.BANNER)
-    parser = argparse.ArgumentParser(add_help=True, description="AceWalk v1 collector")
+    parser = argparse.ArgumentParser(add_help=True, description="AceWalk v1 - LDAP ACE collector")
     parser.add_argument("target", action="store", help="[[domain/]username[:password]]")
-    parser.add_argument("-identity", required=True, action="store", metavar="identity", help="Identity to search (sAMAccountName, DN, or SID)",)
+    parser.add_argument("-identity", required=True, action="store", metavar="identity", 
+                       help="Identity to search (sAMAccountName, DN, or SID)")
+    parser.add_argument("-extended", action="store_true", 
+                       help="Show extended table with ACE Type, Mask, and InheritedObjectType")
 
     parser.add_argument("-ts", action="store_true", help="Adds timestamp to every logging output")
     parser.add_argument("-debug", action="store_true", help="Turn DEBUG output ON")
@@ -483,6 +623,7 @@ def main():
         sys.exit(1)
 
     options = parser.parse_args()
+    
     logger.init(options.ts, options.debug)
 
     domain, username, password, _, _, options.k = parse_identity(
@@ -501,8 +642,11 @@ def main():
     except ldap.LDAPSessionError as e:
         logging.error(str(e))
     except Exception as e:
-        logging.debug("Exception:", exc_info=True)
-        logging.error(str(e))
+        if options.debug:
+            import traceback
+            traceback.print_exc()
+        else:
+            logging.error(str(e))
 
 
 if __name__ == "__main__":
